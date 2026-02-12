@@ -539,16 +539,21 @@ section "STEP 10: Firewall Configuration"
 if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
     # Add HTTPS if not present
     firewall-cmd --permanent --add-service=https &>/dev/null || true
-    # Add WSS port
+    # Add WSS port for WebRTC
     firewall-cmd --permanent --add-port=8089/tcp &>/dev/null || true
-    # Ensure SIP and RTP are open
-    firewall-cmd --permanent --add-port=5060/tcp &>/dev/null || true
-    firewall-cmd --permanent --add-port=5060/udp &>/dev/null || true
-    firewall-cmd --permanent --add-port=10000-20000/udp &>/dev/null || true
+    # RTP media ports (must match rtp.conf rtpstart/rtpend)
+    # Remove old range if present, add correct range
+    firewall-cmd --permanent --remove-port=10000-20000/udp &>/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port=9000-35000/udp &>/dev/null || true
+    # NOTE: SIP 5060/5061 are NOT opened globally here. They should be
+    # restricted to specific trunk IPs via vicidial-server-security-setup.sh.
+    # Opening SIP to the internet invites brute-force attacks.
     firewall-cmd --reload &>/dev/null
-    success "Firewall ports opened: 443, 8089, 5060, 10000-20000/udp"
+    success "Firewall ports opened: 443 (HTTPS), 8089 (WSS), 9000-35000/udp (RTP)"
+    warn "SIP 5060/5061 NOT opened globally — use vicidial-server-security-setup.sh to whitelist trunk IPs"
 else
-    warn "firewalld not active - make sure ports 443, 8089, 5060, 10000-20000/udp are open"
+    warn "firewalld not active - make sure ports 443, 8089, 9000-35000/udp are open"
+    warn "SIP 5060/5061 should be restricted to trunk IPs only (never open globally)"
 fi
 
 # =============================================================================
