@@ -387,6 +387,15 @@ fi
 asterisk -rx "sip reload" &>/dev/null || true
 success "SIP configuration reloaded"
 
+# Fix pjsip.conf placeholder addresses (PJSIP module still loads and logs errors)
+PJSIPCONF="/etc/asterisk/pjsip.conf"
+if grep -q "SERVER_EXTERNAL_IP" "$PJSIPCONF" 2>/dev/null; then
+    backup_file "$PJSIPCONF"
+    sed -i "s|SERVER_EXTERNAL_IP|${PUBLIC_IP}|g" "$PJSIPCONF"
+    asterisk -rx "module reload res_pjsip.so" &>/dev/null || true
+    success "Fixed pjsip.conf placeholder addresses -> ${PUBLIC_IP}"
+fi
+
 # =============================================================================
 # STEP 7: VICIDIAL DATABASE - WebRTC SIP TEMPLATE
 # =============================================================================
