@@ -434,6 +434,15 @@ mysql asterisk -e "UPDATE servers SET
     WHERE server_ip='${SERVER_IP}';" 2>/dev/null
 success "Server WSS URL: wss://${DOMAIN}:8089/ws"
 
+# Create ViciWhite IP list (used by Dynamic Portal for agent IP whitelisting)
+VICIWHITE_EXISTS=$(mysql asterisk -N -e "SELECT COUNT(*) FROM vicidial_ip_lists WHERE ip_list_id='ViciWhite';" 2>/dev/null)
+if [ "$VICIWHITE_EXISTS" = "0" ]; then
+    mysql asterisk -e "INSERT INTO vicidial_ip_lists (ip_list_id, ip_list_name, active, user_group) VALUES ('ViciWhite', 'WebPhone Agent Whitelist', 'Y', '---ALL---');" 2>/dev/null
+    success "Created 'ViciWhite' IP list for agent whitelisting"
+else
+    success "ViciWhite IP list already exists"
+fi
+
 # =============================================================================
 # STEP 8: INSTALL VICIPHONE
 # =============================================================================
