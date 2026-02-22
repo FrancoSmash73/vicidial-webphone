@@ -288,11 +288,20 @@ else
     else
         log "Generating Let's Encrypt certificate for ${CERT_DOMAIN}..."
         if [ "$MODE" = "asterisk" ]; then
-            # Asterisk server: use standalone mode (no web server on port 80)
-            # Temporarily stop Asterisk HTTP if it's holding port 80
-            certbot certonly --standalone \
-                -d "$CERT_DOMAIN" --non-interactive --agree-tos \
-                --register-unsafely-without-email 2>&1 | tail -5
+            # Asterisk server: use webroot if httpd is running on port 80,
+            # otherwise fall back to standalone
+            if ss -tlnp 2>/dev/null | grep -q ':80 '; then
+                log "httpd detected on port 80 — using webroot for certbot"
+                ASTERISK_WEBROOT=$(apachectl -S 2>/dev/null | grep -i "DocumentRoot\|docroot" | head -1 | awk '{print $NF}' || echo "/var/www/html")
+                [ ! -d "$ASTERISK_WEBROOT" ] && ASTERISK_WEBROOT="/var/www/html"
+                certbot certonly --webroot --webroot-path "$ASTERISK_WEBROOT" \
+                    -d "$CERT_DOMAIN" --non-interactive --agree-tos \
+                    --register-unsafely-without-email 2>&1 | tail -5
+            else
+                certbot certonly --standalone \
+                    -d "$CERT_DOMAIN" --non-interactive --agree-tos \
+                    --register-unsafely-without-email 2>&1 | tail -5
+            fi
         else
             # Web/standalone: use webroot (Apache is already running)
             certbot certonly --webroot --webroot-path "$WEBROOT" \
