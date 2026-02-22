@@ -34,6 +34,7 @@ DOMAIN=""                  # shorthand: sets WEB_DOMAIN (standalone/web) or ASTE
 WEB_DOMAIN=""              # FQDN for Server #1 — Apache HTTPS, ViciPhone UI
 ASTERISK_DOMAIN=""         # FQDN for Server #2 — Asterisk WSS cert, sip realm
 ASTERISK_IP=""             # IP of Asterisk server (web mode — for DB updates)
+CARRIER_IP=""              # SIP carrier IP (asterisk mode — whitelisted on port 5060)
 DB_HOST="localhost"        # MySQL host (asterisk mode only, if DB is on a remote server)
 NUM_AGENTS=0
 START_EXT=10001
@@ -104,6 +105,7 @@ Options:
   --web-domain       Server #1 FQDN (Apache HTTPS + ViciPhone)
   --asterisk-domain  Server #2 FQDN (Asterisk WSS cert + realm)
   --asterisk-ip      Asterisk server IP (web mode — updates DB servers table)
+  --carrier-ip       SIP carrier IP (asterisk mode — only IP allowed on port 5060)
   --db-host          MySQL hostname/IP (asterisk mode — connect to remote DB)
   --agents N         Create N agent/phone pairs (default: 0)
   --start-ext N      Starting extension number (default: 10001)
@@ -124,6 +126,7 @@ while [[ $# -gt 0 ]]; do
         --web-domain)      WEB_DOMAIN="$2";      shift 2 ;;
         --asterisk-domain) ASTERISK_DOMAIN="$2"; shift 2 ;;
         --asterisk-ip)     ASTERISK_IP="$2";     shift 2 ;;
+        --carrier-ip)      CARRIER_IP="$2";      shift 2 ;;
         --db-host)         DB_HOST="$2";         shift 2 ;;
         --agents)          NUM_AGENTS="$2";      shift 2 ;;
         --start-ext)       START_EXT="$2";       shift 2 ;;
@@ -691,34 +694,116 @@ fi
 
 # =============================================================================
 # STEP 12: FIREWALL
+# Uses nftables (native on RHEL/Rocky 10). Disables firewalld if present.
+# Asterisk mode: locks port 5060 to carrier IP only — stops SIP brute-force.
 # =============================================================================
-section "STEP 12: Firewall Configuration"
+section "STEP 12: Firewall Configuration (nftables)"
 
-if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null; then
-    # Web ports — only on web/standalone servers
-    if [ "$MODE" != "asterisk" ]; then
-        firewall-cmd --permanent --add-service=https &>/dev/null || true
-        success "Firewall: 443/tcp (HTTPS) opened"
+# Read RTP range from rtp.conf (needed for asterisk/standalone modes)
+RTP_START=$(grep "^rtpstart=" /etc/asterisk/rtp.conf 2>/dev/null | cut -d= -f2 | tr -d ' ')
+RTP_END=$(grep   "^rtpend="   /etc/asterisk/rtp.conf 2>/dev/null | cut -d= -f2 | tr -d ' ')
+RTP_START=${RTP_START:-10000}
+RTP_END=${RTP_END:-20000}
+
+# Disable firewalld if running (conflicts with nftables)
+if systemctl is-active firewalld &>/dev/null; then
+    systemctl stop firewalld
+    systemctl disable firewalld
+    log "firewalld stopped and disabled — using nftables"
+fi
+
+if command -v nft &>/dev/null; then
+    # Build ruleset based on mode
+    if [ "$MODE" = "web" ]; then
+        # Server #1: web/DB only — no SIP, no RTP
+        cat > /etc/sysconfig/nftables.conf <<NFTEOF
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ip  protocol icmp   accept
+        ip6 nexthdr  icmpv6 accept
+        meta l4proto tcp ct state established,related accept
+        tcp dport { 22, 80, 443, 446, 1951 } accept
+    }
+    chain forward { type filter hook forward priority 0; policy drop; }
+    chain output  { type filter hook output  priority 0; policy accept; }
+}
+NFTEOF
+        success "Firewall: web mode — 80/443 open, all else dropped"
+
+    elif [ "$MODE" = "asterisk" ]; then
+        # Server #2: Asterisk — SIP locked to carrier IP, RTP open, 8089 open
+        if [ -z "$CARRIER_IP" ]; then
+            warn "No --carrier-ip specified — port 5060 will be closed entirely (add rich rule manually)"
+            SIP_RULES="# No carrier IP specified — port 5060 blocked"
+        else
+            SIP_RULES="        ip saddr != ${CARRIER_IP} udp dport 5060 drop
+        ip saddr != ${CARRIER_IP} tcp dport 5060 drop
+        ip saddr ${CARRIER_IP} udp dport 5060 accept
+        ip saddr ${CARRIER_IP} tcp dport 5060 accept"
+        fi
+        cat > /etc/sysconfig/nftables.conf <<NFTEOF
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ip  protocol icmp   accept
+        ip6 nexthdr  icmpv6 accept
+        meta l4proto tcp ct state established,related accept
+        # SIP — carrier only (explicit early drop prevents brute-force bypass)
+${SIP_RULES}
+        # SSH, HTTP (certbot), WSS
+        tcp dport { 22, 80, 1951 } accept
+        tcp dport 8089 accept
+        # RTP media
+        udp dport ${RTP_START}-${RTP_END} accept
+    }
+    chain forward { type filter hook forward priority 0; policy drop; }
+    chain output  { type filter hook output  priority 0; policy accept; }
+}
+NFTEOF
+        success "Firewall: asterisk mode — 8089/tcp, ${RTP_START}-${RTP_END}/udp open; 5060 locked to ${CARRIER_IP:-NONE}"
+
+    else
+        # Standalone: all ports on one server
+        if [ -n "$CARRIER_IP" ]; then
+            SIP_RULES="        ip saddr != ${CARRIER_IP} udp dport 5060 drop
+        ip saddr != ${CARRIER_IP} tcp dport 5060 drop
+        ip saddr ${CARRIER_IP} udp dport 5060 accept
+        ip saddr ${CARRIER_IP} tcp dport 5060 accept"
+        else
+            SIP_RULES="        # No --carrier-ip set — port 5060 open (add restriction manually)"
+        fi
+        cat > /etc/sysconfig/nftables.conf <<NFTEOF
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif lo accept
+        ip  protocol icmp   accept
+        ip6 nexthdr  icmpv6 accept
+        meta l4proto tcp ct state established,related accept
+${SIP_RULES}
+        tcp dport { 22, 80, 443, 446, 1951 } accept
+        tcp dport 8089 accept
+        udp dport ${RTP_START}-${RTP_END} accept
+    }
+    chain forward { type filter hook forward priority 0; policy drop; }
+    chain output  { type filter hook output  priority 0; policy accept; }
+}
+NFTEOF
+        success "Firewall: standalone mode — all required ports open"
     fi
 
-    # Asterisk ports — only on asterisk/standalone servers
-    if [ "$MODE" != "web" ]; then
-        firewall-cmd --permanent --add-port=8089/tcp &>/dev/null || true
-
-        RTP_START=$(grep "^rtpstart=" /etc/asterisk/rtp.conf 2>/dev/null | cut -d= -f2 | tr -d ' ')
-        RTP_END=$(grep "^rtpend="   /etc/asterisk/rtp.conf 2>/dev/null | cut -d= -f2 | tr -d ' ')
-        RTP_START=${RTP_START:-10000}
-        RTP_END=${RTP_END:-20000}
-        firewall-cmd --permanent --add-port=${RTP_START}-${RTP_END}/udp &>/dev/null || true
-        success "Firewall: 8089/tcp, ${RTP_START}-${RTP_END}/udp (RTP) opened"
-    fi
-
-    firewall-cmd --reload &>/dev/null
-    success "Firewall rules applied"
+    # Apply and enable
+    nft flush ruleset
+    nft -f /etc/sysconfig/nftables.conf
+    systemctl enable nftables &>/dev/null
+    systemctl start  nftables &>/dev/null
+    success "nftables rules applied and enabled (persistent)"
 else
-    warn "firewalld not active — open required ports manually:"
-    [ "$MODE" != "asterisk" ] && warn "  Server #1: 443/tcp"
-    [ "$MODE" != "web" ]      && warn "  Server #2: 8089/tcp, 10000-20000/udp"
+    warn "nftables not found — install with: dnf install -y nftables"
+    warn "Open ports manually: 443(web), 8089(WSS), ${RTP_START}-${RTP_END}/udp(RTP), 5060(carrier only)"
 fi
 
 # =============================================================================
